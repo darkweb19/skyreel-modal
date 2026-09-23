@@ -898,7 +898,7 @@ class VideoGenerator:
     timeout=300,
 )
 @modal.asgi_app(
-    label="generate"
+    label="skyreels"
 )
 def api():
 
