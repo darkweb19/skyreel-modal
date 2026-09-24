@@ -382,7 +382,7 @@ def duration_to_frames(
 @app.cls(
     image=gpu_image,
 
-    gpu="A100-80GB",
+    gpu="L40S",
 
     volumes={
         MODEL_CACHE: model_volume,
