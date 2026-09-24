@@ -1185,14 +1185,43 @@ def api():
 
         try:
 
-            VideoGenerator().generate.spawn(
+            log_event(
+                "gpu_dispatch_requested",
+                job=job_id,
+            )
+
+            call = await (
+                VideoGenerator()
+                .generate
+                .spawn
+                .aio(
+                    job_id,
+                    body.prompt,
+                    body.model,
+                    body.duration,
+                    body.resolution,
+                    body.aspect_ratio,
+                    seed,
+                )
+            )
+
+            job[
+                "modal_call_id"
+            ] = call.object_id
+
+            job[
+                "stage"
+            ] = "dispatched"
+
+            await write_job_async(
                 job_id,
-                body.prompt,
-                body.model,
-                body.duration,
-                body.resolution,
-                body.aspect_ratio,
-                seed,
+                job,
+            )
+
+            log_event(
+                "gpu_job_dispatched",
+                job=job_id,
+                call_id=call.object_id,
             )
 
         except Exception as error:
@@ -1203,7 +1232,7 @@ def api():
                         "failed",
 
                     "stage":
-                        "failed",
+                        "dispatch_failed",
 
                     "error":
                         str(error),
@@ -1213,6 +1242,14 @@ def api():
             await write_job_async(
                 job_id,
                 job,
+            )
+
+            log_event(
+                "gpu_dispatch_failed",
+                job=job_id,
+                error=repr(
+                    error
+                ),
             )
 
             raise HTTPException(
@@ -1231,13 +1268,16 @@ def api():
                 "pending",
 
             "stage":
-                "queued",
+                "dispatched",
 
             "model":
                 body.model,
 
             "progress":
                 0,
+
+            "modal_call_id":
+                call.object_id,
         }
 
     # ========================================================
