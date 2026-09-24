@@ -30,7 +30,7 @@ KEEP_WARM_SECONDS = 120
 FPS = 24
 
 MIN_DURATION = 1
-MAX_DURATION = 5
+MAX_DURATION = 6
 
 # SkyReels official/recommended settings
 NUM_INFERENCE_STEPS = 50
@@ -296,6 +296,48 @@ async def read_job_async(
     )
 
 
+
+async def reconcile_modal_call(job: dict) -> dict:
+    """
+    Reconcile a non-terminal job with its underlying Modal FunctionCall.
+
+    This catches failures that happen before VideoGenerator.generate() starts,
+    including GPU scheduling/startup, snapshot restore, container bootstrap,
+    and @modal.enter() failures.
+    """
+    if job.get("status") in {"completed", "failed"}:
+        return job
+
+    call_id = job.get("modal_call_id")
+    if not call_id:
+        return job
+
+    try:
+        call = modal.FunctionCall.from_id(call_id)
+        await call.get.aio(timeout=0)
+    except TimeoutError:
+        return job
+    except Exception as error:
+        job.update(
+            {
+                "status": "failed",
+                "stage": "worker_failed",
+                "progress": 0,
+                "error": str(error),
+                "completed_at": int(time.time()),
+            }
+        )
+        await write_job_async(job["id"], job)
+        log_event(
+            "modal_worker_failed",
+            job=job["id"],
+            call_id=call_id,
+            error=repr(error),
+        )
+
+    return job
+
+
 def duration_to_frames(
     duration: int,
 ) -> int:
@@ -320,11 +362,15 @@ def duration_to_frames(
         4 * n + 1
     )
 
+    max_frames = MAX_DURATION * FPS
+    max_n = round((max_frames - 1) / 4)
+    max_compatible_frames = 4 * max_n + 1
+
     return max(
         25,
         min(
             frames,
-            121,
+            max_compatible_frames,
         ),
     )
 
@@ -886,15 +932,12 @@ class VideoGenerator:
 
 @app.function(
     image=api_image,
-
     volumes={
         JOBS_DIR: jobs_volume,
     },
-
     secrets=[
         api_secret,
     ],
-
     timeout=300,
 )
 @modal.asgi_app(
@@ -913,30 +956,11 @@ def api():
         FileResponse,
     )
 
-    from pydantic import (
-        BaseModel,
-        Field,
-    )
-
-    # ========================================================
-    # REDUCE APPLICATION ACCESS LOGGING
-    # ========================================================
-
-    logging.getLogger(
-        "uvicorn.access"
-    ).disabled = True
-
-    logging.getLogger(
-        "uvicorn.error"
-    ).setLevel(
-        logging.WARNING
-    )
-
-    logging.getLogger(
-        "fastapi"
-    ).setLevel(
-        logging.WARNING
-    )
+    # Modal emits its own edge/router request lines. Silence framework-level
+    # access logging where possible; Retry-After lets clients back off.
+    logging.getLogger("uvicorn.access").disabled = True
+    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    logging.getLogger("fastapi").setLevel(logging.WARNING)
 
     api_app = FastAPI(
         title="SkyReels Video API",
@@ -946,85 +970,32 @@ def api():
     # AUTH
     # ========================================================
 
-    def authenticate(
-        request: Request,
-    ):
-
-        expected = os.environ.get(
-            "MODAL_VIDEO_API_KEY"
-        )
-
-        if not expected:
+    def authenticate(request: Request):
+        expected_key = os.environ.get("MODAL_VIDEO_API_KEY")
+        if not expected_key:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Server API key "
-                    "is not configured"
-                ),
+                detail="Server API key is not configured",
             )
 
-        auth = request.headers.get(
-            "Authorization",
-            "",
-        )
+        authorization = request.headers.get("Authorization", "")
+        expected = f"Bearer {expected_key}"
 
-        if auth.startswith(
-            "Bearer "
-        ):
-            supplied = (
-                auth[7:]
-            )
-        else:
-            supplied = (
-                request.headers.get(
-                    "X-API-Key",
-                    "",
-                )
-            )
-
-        if not secrets.compare_digest(
-            supplied,
-            expected,
-        ):
+        if not secrets.compare_digest(authorization, expected):
             raise HTTPException(
                 status_code=401,
-                detail="Unauthorized",
+                detail="Invalid API key",
+                headers={
+                    "WWW-Authenticate": "Bearer",
+                },
             )
-
-    # ========================================================
-    # REQUEST BODY
-    # ========================================================
-
-    class GenerateRequest(
-        BaseModel
-    ):
-        prompt: str = Field(
-            min_length=1,
-        )
-
-        model: str = MODEL_ID
-
-        duration: int = Field(
-            default=4,
-            ge=MIN_DURATION,
-            le=MAX_DURATION,
-        )
-
-        resolution: str = "720p"
-
-        aspect_ratio: str = "9:16"
-
-        seed: int | None = None
 
     # ========================================================
     # HEALTH
     # ========================================================
 
-    @api_app.get(
-        "/health"
-    )
+    @api_app.get("/health")
     async def health():
-
         return {
             "status": "ok",
             "model": MODEL_ID,
@@ -1032,44 +1003,27 @@ def api():
 
     # ========================================================
     # MODELS
+    #
+    # Same OpenRouter-style schema consumed by modal.go.
+    # GET /api/v1/videos/models
     # ========================================================
 
-    @api_app.get(
-        "/api/v1/videos/models"
-    )
-    async def models(
-        request: Request,
-    ):
-
-        authenticate(
-            request
-        )
+    @api_app.get("/api/v1/videos/models")
+    async def list_models(request: Request):
+        authenticate(request)
 
         return {
             "data": [
                 {
-                    "id":
-                        MODEL_ID,
-
-                    "name":
-                        MODEL_NAME,
-
-                    "type":
-                        "video",
-
-                    "resolutions":
-                        SUPPORTED_RESOLUTIONS,
-
-                    "aspect_ratios":
-                        SUPPORTED_ASPECT_RATIOS,
-
-                    "durations": [
-                        1,
-                        2,
-                        3,
-                        4,
-                        5,
-                    ],
+                    "id": MODEL_ID,
+                    "name": MODEL_NAME,
+                    "supported_durations": list(
+                        range(MIN_DURATION, MAX_DURATION + 1)
+                    ),
+                    "supported_resolutions": SUPPORTED_RESOLUTIONS,
+                    "supported_aspect_ratios": SUPPORTED_ASPECT_RATIOS,
+                    "generate_audio": False,
+                    "pricing_skus": {},
                 }
             ]
         }
@@ -1077,114 +1031,139 @@ def api():
     # ========================================================
     # CREATE VIDEO
     #
+    # OpenRouter-compatible request fields:
+    # model, prompt, duration, resolution, aspect_ratio,
+    # generate_audio. seed is accepted as an optional Modal extension.
+    #
     # POST /api/v1/videos
     # ========================================================
 
     @api_app.post(
-        "/api/v1/videos"
+        "/api/v1/videos",
+        status_code=202,
     )
-    async def create_video(
-        body: GenerateRequest,
-        request: Request,
-    ):
-
-        authenticate(
-            request
-        )
-
-        if (
-            body.resolution
-            not in
-            SUPPORTED_RESOLUTIONS
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported resolution"
-                ),
-            )
-
-        if (
-            body.aspect_ratio
-            not in
-            SUPPORTED_ASPECT_RATIOS
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported aspect ratio"
-                ),
-            )
-
-        if body.model != MODEL_ID:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Unsupported model: "
-                    f"{body.model}"
-                ),
-            )
-
-        seed = (
-            body.seed
-            if body.seed is not None
-            else secrets.randbelow(
-                2**31 - 1
-            )
-        )
-
-        job_id = (
-            "gen_"
-            + uuid.uuid4().hex
-        )
-
-        job = {
-            "id":
-                job_id,
-
-            "status":
-                "pending",
-
-            "stage":
-                "queued",
-
-            "model":
-                body.model,
-
-            "progress":
-                0,
-
-            "prompt":
-                body.prompt,
-
-            "duration":
-                body.duration,
-
-            "resolution":
-                body.resolution,
-
-            "aspect_ratio":
-                body.aspect_ratio,
-
-            "seed":
-                seed,
-
-            "created_at":
-                int(
-                    time.time()
-                ),
-
-            "error":
-                "",
-        }
-
-        await write_job_async(
-            job_id,
-            job,
-        )
+    async def create_video(request: Request):
+        authenticate(request)
 
         try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid JSON",
+            )
 
+        model = body.get("model", MODEL_ID)
+        if model != MODEL_ID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported model: {model}",
+            )
+
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str):
+            raise HTTPException(
+                status_code=400,
+                detail="prompt must be a string",
+            )
+
+        prompt = prompt.strip()
+        if not prompt:
+            raise HTTPException(
+                status_code=400,
+                detail="prompt is required",
+            )
+
+        raw_duration = body.get("duration", 4)
+        try:
+            duration = int(raw_duration)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="duration must be an integer",
+            )
+
+        if duration < MIN_DURATION or duration > MAX_DURATION:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"duration must be between "
+                    f"{MIN_DURATION} and {MAX_DURATION} seconds"
+                ),
+            )
+
+        resolution = str(
+            body.get("resolution", "480p")
+        ).lower()
+
+        if resolution not in SUPPORTED_RESOLUTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail="resolution must be '480p' or '720p'",
+            )
+
+        aspect_ratio = str(
+            body.get("aspect_ratio", "9:16")
+        )
+
+        if aspect_ratio not in SUPPORTED_ASPECT_RATIOS:
+            raise HTTPException(
+                status_code=400,
+                detail="aspect_ratio must be '9:16' or '16:9'",
+            )
+
+        generate_audio = body.get("generate_audio", False)
+        if generate_audio:
+            raise HTTPException(
+                status_code=400,
+                detail="SkyReels V2 T2V does not generate audio",
+            )
+
+        raw_seed = body.get("seed")
+        if raw_seed is None:
+            seed = secrets.randbelow(2**31 - 1)
+        else:
+            try:
+                seed = int(raw_seed)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="seed must be an integer",
+                )
+
+            if seed < 0:
+                seed = secrets.randbelow(2**31 - 1)
+
+        combination = (
+            resolution,
+            aspect_ratio,
+        )
+        if combination not in SIZE_MAP:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported resolution and aspect ratio",
+            )
+
+        job_id = "gen_" + uuid.uuid4().hex
+
+        job = {
+            "id": job_id,
+            "status": "pending",
+            "stage": "queued",
+            "model": model,
+            "progress": 0,
+            "prompt": prompt,
+            "duration": duration,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "seed": seed,
+            "created_at": int(time.time()),
+            "error": "",
+        }
+
+        await write_job_async(job_id, job)
+
+        try:
             log_event(
                 "gpu_dispatch_requested",
                 job=job_id,
@@ -1193,25 +1172,19 @@ def api():
             call = await (
                 VideoGenerator()
                 .generate
-                .spawn
-                .aio(
-                    job_id,
-                    body.prompt,
-                    body.model,
-                    body.duration,
-                    body.resolution,
-                    body.aspect_ratio,
-                    seed,
+                .spawn.aio(
+                    job_id=job_id,
+                    prompt=prompt,
+                    model=model,
+                    duration=duration,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    seed=seed,
                 )
             )
 
-            job[
-                "modal_call_id"
-            ] = call.object_id
-
-            job[
-                "stage"
-            ] = "dispatched"
+            job["modal_call_id"] = call.object_id
+            job["stage"] = "dispatched"
 
             await write_job_async(
                 job_id,
@@ -1225,17 +1198,12 @@ def api():
             )
 
         except Exception as error:
-
             job.update(
                 {
-                    "status":
-                        "failed",
-
-                    "stage":
-                        "dispatch_failed",
-
-                    "error":
-                        str(error),
+                    "status": "failed",
+                    "stage": "dispatch_failed",
+                    "error": str(error),
+                    "completed_at": int(time.time()),
                 }
             )
 
@@ -1247,141 +1215,68 @@ def api():
             log_event(
                 "gpu_dispatch_failed",
                 job=job_id,
-                error=repr(
-                    error
-                ),
+                error=repr(error),
             )
 
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Could not start "
-                    "video generation"
-                ),
+                detail="Could not start video generation",
             )
 
         return {
-            "id":
-                job_id,
-
-            "status":
-                "pending",
-
-            "stage":
-                "dispatched",
-
-            "model":
-                body.model,
-
-            "progress":
-                0,
-
-            "modal_call_id":
-                call.object_id,
+            "id": job_id,
+            "status": "pending",
+            "stage": "dispatched",
+            "model": model,
+            "progress": 0,
+            "modal_call_id": call.object_id,
+            "poll_after_seconds": STATUS_POLL_RETRY_SECONDS,
         }
 
     # ========================================================
-    # POLL VIDEO
+    # STATUS
     #
     # GET /api/v1/videos/{id}
     # ========================================================
 
-    @api_app.get(
-        "/api/v1/videos/{job_id}"
-    )
+    @api_app.get("/api/v1/videos/{job_id}")
     async def get_video(
         job_id: str,
         request: Request,
         response: Response,
     ):
+        authenticate(request)
 
-        authenticate(
-            request
-        )
-
-        job = await read_job_async(
-            job_id
-        )
+        job = await read_job_async(job_id)
 
         if job is None:
-
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Generation not found"
-                ),
+                detail="Generation not found",
             )
 
-        if (
-            job.get(
-                "status"
-            )
-            not in {
-                "completed",
-                "failed",
-            }
-        ):
+        job = await reconcile_modal_call(job)
 
-            response.headers[
-                "Retry-After"
-            ] = str(
+        if job.get("status") not in {"completed", "failed"}:
+            response.headers["Retry-After"] = str(
                 STATUS_POLL_RETRY_SECONDS
             )
 
         result = {
-            "id":
-                job["id"],
-
-            "status":
-                job["status"],
-
-            "model":
-                job.get(
-                    "model",
-                    MODEL_ID,
-                ),
-
-            "progress":
-                job.get(
-                    "progress",
-                    0,
-                ),
-
-            "stage":
-                job.get(
-                    "stage",
-                    "unknown",
-                ),
+            "id": job["id"],
+            "status": job["status"],
+            "model": job.get("model", MODEL_ID),
+            "progress": job.get("progress", 0),
+            "stage": job.get("stage", "unknown"),
         }
 
-        if (
-            job["status"]
-            not in {
-                "completed",
-                "failed",
-            }
-        ):
+        if job.get("status") not in {"completed", "failed"}:
+            result["poll_after_seconds"] = STATUS_POLL_RETRY_SECONDS
 
-            result[
-                "poll_after_seconds"
-            ] = (
-                STATUS_POLL_RETRY_SECONDS
-            )
-
-        # --------------------------------------------
-        # COMPLETED
-        # --------------------------------------------
-
-        if (
-            job["status"]
-            == "completed"
-        ):
-
+        if job["status"] == "completed":
             base_url = str(
                 request.base_url
-            ).rstrip(
-                "/"
-            )
+            ).rstrip("/")
 
             content_url = (
                 f"{base_url}"
@@ -1390,70 +1285,40 @@ def api():
                 f"/content?index=0"
             )
 
-            result[
-                "unsigned_urls"
-            ] = [
+            result["unsigned_urls"] = [
                 content_url
             ]
 
-            result[
-                "usage"
-            ] = {
-                "cost":
-                    job.get(
-                        "usage_cost_usd",
-                        0.0,
-                    ),
-
-                "currency":
-                    "USD",
-
-                "gpu_seconds":
-                    job.get(
-                        "gpu_billed_seconds"
-                    ),
-
-                "gpu_rate_usd_per_second":
-                    job.get(
-                        "gpu_rate_usd_per_second",
-                        A100_80GB_USD_PER_SECOND,
-                    ),
-
-                "basis":
-                    "measured_generation_runtime",
+            result["usage"] = {
+                "cost": job.get(
+                    "usage_cost_usd",
+                    0.0,
+                ),
+                "currency": "USD",
+                "gpu_seconds": job.get(
+                    "gpu_billed_seconds"
+                ),
+                "gpu_rate_usd_per_second": job.get(
+                    "gpu_rate_usd_per_second",
+                    A100_80GB_USD_PER_SECOND,
+                ),
+                "basis": "measured_generation_runtime",
             }
 
-            result[
-                "timings"
-            ] = {
-                "inference_seconds":
-                    job.get(
-                        "inference_seconds"
-                    ),
-
-                "encode_seconds":
-                    job.get(
-                        "encode_seconds"
-                    ),
-
-                "total_seconds":
-                    job.get(
-                        "total_seconds"
-                    ),
+            result["timings"] = {
+                "inference_seconds": job.get(
+                    "inference_seconds"
+                ),
+                "encode_seconds": job.get(
+                    "encode_seconds"
+                ),
+                "total_seconds": job.get(
+                    "total_seconds"
+                ),
             }
 
-        # --------------------------------------------
-        # FAILED
-        # --------------------------------------------
-
-        if (
-            job["status"]
-            == "failed"
-        ):
-
-            result[
-                "error"
-            ] = job.get(
+        if job["status"] == "failed":
+            result["error"] = job.get(
                 "error",
                 "Generation failed",
             )
@@ -1466,81 +1331,57 @@ def api():
     # GET /api/v1/videos/{id}/content?index=0
     # ========================================================
 
-    @api_app.get(
-        "/api/v1/videos/{job_id}/content"
-    )
+    @api_app.get("/api/v1/videos/{job_id}/content")
     async def get_content(
         job_id: str,
         request: Request,
         index: int = 0,
     ):
-
-        authenticate(
-            request
-        )
+        authenticate(request)
 
         if index != 0:
-
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Only output "
-                    "index 0 exists"
-                ),
+                detail="Only output index 0 exists",
             )
 
-        job = await read_job_async(
-            job_id
-        )
+        job = await read_job_async(job_id)
 
         if job is None:
-
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Generation not found"
-                ),
+                detail="Generation not found",
             )
 
-        if (
-            job["status"]
-            != "completed"
-        ):
+        job = await reconcile_modal_call(job)
+
+        if job["status"] != "completed":
+            if job["status"] == "failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail=job.get(
+                        "error",
+                        "Generation failed",
+                    ),
+                )
 
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Generation is not "
-                    "completed yet"
-                ),
+                detail="Generation is not completed yet",
             )
 
-        path = job_video_path(
-            job_id
-        )
+        path = job_video_path(job_id)
 
         if not path.exists():
-
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Generated video "
-                    "file not found"
-                ),
+                detail="Generated video file not found",
             )
 
         return FileResponse(
-            path=str(
-                path
-            ),
-
-            media_type=(
-                "video/mp4"
-            ),
-
-            filename=(
-                f"{job_id}.mp4"
-            ),
+            path=str(path),
+            media_type="video/mp4",
+            filename=f"{job_id}.mp4",
         )
 
     return api_app
