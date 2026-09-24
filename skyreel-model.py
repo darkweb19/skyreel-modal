@@ -37,8 +37,12 @@ NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 6.0
 FLOW_SHIFT = 8.0
 
-# Modal A100-80GB current GPU price
-L40S_USD_PER_SECOND = 0.000542
+# Modal GPU rates used for per-request estimated compute cost.
+GPU_RATE_USD_PER_SECOND = {
+    "L40S": 0.000542,
+    "A100-80GB": 0.000694,
+    "H100": 0.001097,
+}
 
 STATUS_POLL_RETRY_SECONDS = 2
 
@@ -177,6 +181,44 @@ def log_event(
         " | ".join(pieces),
         flush=True,
     )
+
+
+def detect_runtime_gpu_name() -> str:
+    """Return the Modal GPU type actually assigned to this container."""
+    try:
+        import subprocess
+
+        raw = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name",
+                "--format=csv,noheader",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        ).strip().splitlines()
+
+        if not raw:
+            return "unknown"
+
+        name = raw[0].strip()
+
+        if "L40S" in name:
+            return "L40S"
+        if "A100" in name:
+            return "A100-80GB"
+        if "H100" in name:
+            return "H100"
+
+        return name
+
+    except Exception:
+        return "unknown"
+
+
+def gpu_rate_for_name(gpu_name: str) -> float:
+    return GPU_RATE_USD_PER_SECOND.get(gpu_name, 0.0)
 
 
 def job_json_path(
@@ -382,7 +424,7 @@ def duration_to_frames(
 @app.cls(
     image=gpu_image,
 
-    gpu="L40S",
+    gpu=["L40S", "A100-80GB", "H100"],
 
     volumes={
         MODEL_CACHE: model_volume,
@@ -431,10 +473,16 @@ class VideoGenerator:
             time.time()
         )
 
+        self.runtime_gpu_name = detect_runtime_gpu_name()
+        self.runtime_gpu_rate = gpu_rate_for_name(
+            self.runtime_gpu_name
+        )
+
         log_event(
             "worker_starting",
             model=MODEL_NAME,
-            gpu="L40S",
+            gpu=self.runtime_gpu_name,
+            gpu_rate_usd_per_second=self.runtime_gpu_rate,
         )
 
         model_path = (
@@ -808,9 +856,20 @@ class VideoGenerator:
             # COST
             # --------------------------------------------
 
+            runtime_gpu_name = getattr(
+                self,
+                "runtime_gpu_name",
+                "unknown",
+            )
+            runtime_gpu_rate = getattr(
+                self,
+                "runtime_gpu_rate",
+                0.0,
+            )
+
             usage_cost_usd = round(
                 total_seconds
-                * L40S_USD_PER_SECOND,
+                * runtime_gpu_rate,
 
                 6,
             )
@@ -851,8 +910,11 @@ class VideoGenerator:
                     "gpu_billed_seconds":
                         total_seconds,
 
+                    "gpu_name":
+                        runtime_gpu_name,
+
                     "gpu_rate_usd_per_second":
-                        L40S_USD_PER_SECOND,
+                        runtime_gpu_rate,
 
                     "completed_at":
                         int(
@@ -1298,9 +1360,13 @@ def api():
                 "gpu_seconds": job.get(
                     "gpu_billed_seconds"
                 ),
+                "gpu_name": job.get(
+                    "gpu_name",
+                    "unknown",
+                ),
                 "gpu_rate_usd_per_second": job.get(
                     "gpu_rate_usd_per_second",
-                    L40S_USD_PER_SECOND,
+                    0.0,
                 ),
                 "basis": "measured_generation_runtime",
             }
