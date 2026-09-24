@@ -38,7 +38,7 @@ GUIDANCE_SCALE = 6.0
 FLOW_SHIFT = 8.0
 
 # Modal A100-80GB current GPU price
-A100_80GB_USD_PER_SECOND = 0.000694
+L40S_USD_PER_SECOND = 0.000542
 
 STATUS_POLL_RETRY_SECONDS = 2
 
@@ -434,7 +434,7 @@ class VideoGenerator:
         log_event(
             "worker_starting",
             model=MODEL_NAME,
-            gpu="A100-80GB",
+            gpu="L40S",
         )
 
         model_path = (
@@ -810,7 +810,7 @@ class VideoGenerator:
 
             usage_cost_usd = round(
                 total_seconds
-                * A100_80GB_USD_PER_SECOND,
+                * L40S_USD_PER_SECOND,
 
                 6,
             )
@@ -852,7 +852,7 @@ class VideoGenerator:
                         total_seconds,
 
                     "gpu_rate_usd_per_second":
-                        A100_80GB_USD_PER_SECOND,
+                        L40S_USD_PER_SECOND,
 
                     "completed_at":
                         int(
@@ -1300,7 +1300,7 @@ def api():
                 ),
                 "gpu_rate_usd_per_second": job.get(
                     "gpu_rate_usd_per_second",
-                    A100_80GB_USD_PER_SECOND,
+                    L40S_USD_PER_SECOND,
                 ),
                 "basis": "measured_generation_runtime",
             }
